@@ -1,0 +1,24 @@
+# Dependencias
+node_modules/
+package-lock.json
+yarn.lock
+
+# Entorno y secretos — NUNCA commitear credenciales
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+secrets/
+
+# n8n
+.n8n/
+
+# Logs y temporales
+*.log
+tmp/
+.DS_Store
+
+# Editores
+.vscode/
+.idea/

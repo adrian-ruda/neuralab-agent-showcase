@@ -1,0 +1,198 @@
+{
+  "name": "showcase-inbound-example",
+  "meta": {
+    "description": "Ejemplo MINIMO de arquitectura (no productivo, sin datos reales). Ilustra el flujo inbound -> dedup -> router -> RAG -> LLM -> sanitize -> send. Credenciales e IDs son placeholders ficticios."
+  },
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "inbound-example",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "node-0001-webhook",
+      "name": "Inbound Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 400],
+      "webhookId": "example-webhook-id-000000",
+      "notes": "Entrada omnicanal. El payload trae channel + external_ref + message. El mismo patron normaliza WhatsApp / Widget / Messenger antes de despachar al mismo cerebro."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO inbound_dedup (bot_id, channel, external_ref, message_hash)\nVALUES ($1, $2, $3, $4)\nON CONFLICT (bot_id, channel, external_ref, message_hash)\nDO UPDATE SET seen_count = inbound_dedup.seen_count + 1\nRETURNING (xmax = 0) AS is_new;",
+        "additionalFields": {}
+      },
+      "id": "node-0002-dedup",
+      "name": "Atomic Dedup",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [480, 400],
+      "credentials": {
+        "postgres": {
+          "id": "{{ POSTGRES_CREDENTIAL }}",
+          "name": "postgres-placeholder"
+        }
+      },
+      "notes": "Dedup atomico de mensajes entrantes: INSERT ... ON CONFLICT DO UPDATE RETURNING detecta nuevo (is_new=true) vs repetido en una sola operacion sin race conditions."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "version": 2 },
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{ $json.is_new }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true" }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-0003-isnew",
+      "name": "Is New Message?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [720, 400],
+      "notes": "Si el mensaje es repetido (is_new=false) se descarta: corta reprocesamiento y bucles."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT bot_id, display_name, system_prompt, llm_model, rag_enabled, rag_top_k, integrations\nFROM bot_config\nWHERE bot_id = $1 AND active = true;",
+        "additionalFields": {}
+      },
+      "id": "node-0004-router",
+      "name": "Tenant Router (load config)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [960, 320],
+      "credentials": {
+        "postgres": {
+          "id": "{{ POSTGRES_CREDENTIAL }}",
+          "name": "postgres-placeholder"
+        }
+      },
+      "notes": "Ruteo multi-tenant por bot_id. UN workflow atiende N clientes; la config (persona, modelo, flags RAG) se carga por fila, no por fork."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Smart RAG Check: decide si consultar la base de conocimiento en este turno.\n// (version inline del patron; ver examples/smart-rag-check.js para el detalle)\nconst stage = $json.lead_stage || 'new';\nconst tenant = $json;\nconst earlyStages = ['new', 'discovery', 'qualifying'];\nconst useRag = tenant.rag_enabled !== false && earlyStages.includes(stage);\nreturn [{ json: { ...$json, use_rag: useRag, top_k: tenant.rag_top_k || 4 } }];"
+      },
+      "id": "node-0005-smartrag",
+      "name": "Smart RAG Check",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1200, 320],
+      "notes": "Saltea el RAG en etapas avanzadas de la conversacion para no inflar el contexto (ahorro de tokens)."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT chunk, source\nFROM knowledge\nWHERE bot_id = $1\nORDER BY embedding <=> $2\nLIMIT $3;",
+        "additionalFields": {}
+      },
+      "id": "node-0006-retriever",
+      "name": "RAG Retriever (pgvector topK)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1440, 320],
+      "credentials": {
+        "postgres": {
+          "id": "{{ VECTOR_DB_CREDENTIAL }}",
+          "name": "pgvector-placeholder"
+        }
+      },
+      "notes": "Retrieval top-K por distancia coseno (<=>) sobre pgvector, aislado por bot_id. $2 es el embedding de la consulta del usuario. La respuesta se ancla a estos chunks (anti-alucinacion)."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://llm.example.invalid/v1/generate",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "Bearer {{ LLM_API_CREDENTIAL }}" }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "model", "value": "={{ $json.llm_model }}" },
+            { "name": "system", "value": "={{ $json.system_prompt }}" },
+            { "name": "context", "value": "={{ $json.rag_chunks }}" },
+            { "name": "message", "value": "={{ $json.user_message }}" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-0007-llm",
+      "name": "LLM Brain (Gemini 2.5 Flash)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1680, 320],
+      "notes": "Motor principal Gemini 2.5 Flash. El LLM PROPONE una salida estructurada; nunca habla directo al usuario. La key va por referencia a vault, nunca embebida."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Sanitizacion determinista POST-LLM (version inline).\n// Ver examples/sanitize-output.js para el patron completo (parse, leak detect, fallback).\nconst raw = $json.body || $json.output || '';\nlet reply = String(raw).replace(/^\\s*(assistant|bot)\\s*:\\s*/i, '').trim();\nconst leak = /system\\s*prompt|api[_-]?key|bearer/i.test(reply);\nif (leak || reply.length === 0) {\n  return [{ json: { text: 'Disculpa, no pude procesar eso. Podes reformularlo?', leak, persist: false } }];\n}\nreturn [{ json: { text: reply.slice(0, 1500), leak: false, persist: true } }];"
+      },
+      "id": "node-0008-sanitize",
+      "name": "Sanitize Output + Anti-Leak Gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1920, 320],
+      "notes": "Filtro determinista: valida/limpia la salida del LLM antes de enviarla. Si detecta leak, marca persist=false para que la respuesta NO se guarde en el historial (corta bucles de contaminacion)."
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { \"reply\": $json.text } }}",
+        "options": {}
+      },
+      "id": "node-0009-send",
+      "name": "Send Reply",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [2160, 320],
+      "notes": "Envio al canal. En produccion, aqui va el adaptador del canal (WhatsApp Business API u otro). Solo se envia el texto ya sanitizado."
+    }
+  ],
+  "connections": {
+    "Inbound Webhook": {
+      "main": [[{ "node": "Atomic Dedup", "type": "main", "index": 0 }]]
+    },
+    "Atomic Dedup": {
+      "main": [[{ "node": "Is New Message?", "type": "main", "index": 0 }]]
+    },
+    "Is New Message?": {
+      "main": [
+        [{ "node": "Tenant Router (load config)", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "Tenant Router (load config)": {
+      "main": [[{ "node": "Smart RAG Check", "type": "main", "index": 0 }]]
+    },
+    "Smart RAG Check": {
+      "main": [[{ "node": "RAG Retriever (pgvector topK)", "type": "main", "index": 0 }]]
+    },
+    "RAG Retriever (pgvector topK)": {
+      "main": [[{ "node": "LLM Brain (Gemini 2.5 Flash)", "type": "main", "index": 0 }]]
+    },
+    "LLM Brain (Gemini 2.5 Flash)": {
+      "main": [[{ "node": "Sanitize Output + Anti-Leak Gate", "type": "main", "index": 0 }]]
+    },
+    "Sanitize Output + Anti-Leak Gate": {
+      "main": [[{ "node": "Send Reply", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}
