@@ -1,0 +1,18 @@
+{
+  // Neuralab agent-showcase — markdownlint rules for docs/ and README.md.
+  //
+  // Everything else stays on markdownlint's default rule set (heading
+  // structure, list formatting, fenced-code-block language, no duplicate
+  // headings, etc.) — those catch real structural mistakes.
+  "default": true,
+
+  // MD013 (line-length): these docs are hand-wrapped prose (~85-90 cols),
+  // not code. Wrapping doesn't change how Markdown renders, so enforcing an
+  // 80-col limit here would just force re-wrapping paragraphs for no
+  // functional gain.
+  "MD013": false,
+
+  // MD060 (table-column-style): pedantic pipe-padding preference. GitHub
+  // renders the tables in this repo correctly regardless of pipe spacing.
+  "MD060": false
+}

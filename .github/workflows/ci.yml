@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  schema:
+    name: Validate sql/schema.sql (Postgres + pgvector)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: showcase
+          POSTGRES_PASSWORD: showcase
+          POSTGRES_DB: showcase
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U showcase -d showcase"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # This is a real Postgres 16 instance with the pgvector extension
+      # available (not a syntax-only linter). Applying the DDL for real
+      # catches everything a live deploy would: the `vector` type, the HNSW
+      # index, JSONB defaults, FK/CHECK constraints, all of it.
+      - name: Apply schema.sql
+        env:
+          PGPASSWORD: showcase
+        run: |
+          psql -h localhost -U showcase -d showcase \
+            -v ON_ERROR_STOP=1 \
+            -f sql/schema.sql
+
+      - name: Confirm the expected tables and indexes exist
+        env:
+          PGPASSWORD: showcase
+        run: |
+          psql -h localhost -U showcase -d showcase -v ON_ERROR_STOP=1 <<'SQL'
+            -- Fails the job (non-zero exit) if any expected object is missing.
+            DO $$
+            BEGIN
+              ASSERT (SELECT count(*) FROM information_schema.tables
+                      WHERE table_name IN
+                        ('bot_config', 'leads', 'conversaciones',
+                         'knowledge', 'turnos_observabilidad')) = 5,
+                'expected 5 core tables, found a different count';
+
+              ASSERT to_regclass('idx_knowledge_embedding') IS NOT NULL,
+                'HNSW vector index idx_knowledge_embedding is missing';
+            END $$;
+          SQL
+
+  markdownlint:
+    name: Markdownlint (docs/ + README.md)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Structural checks (headings, lists, fenced code blocks) — not a full
+      # rewrite of the prose. Config lives in .markdownlint.jsonc.
+      - name: Lint README.md and docs/
+        run: npx --yes markdownlint-cli2 "README.md" "docs/**/*.md"
